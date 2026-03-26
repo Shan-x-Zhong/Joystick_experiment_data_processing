@@ -1,0 +1,984 @@
+clear;
+clc;
+
+% =======================================================================
+% ACTION REGULATION TASK ANALYSIS - INCLUDING GO TASK
+% Batch processing script for Go, Stop and Switch task behavioral data
+% Classifies trials as Proactive, Reactive, or Failed based on kinematics
+% =======================================================================
+
+baseDir = '/Users/shan/Desktop/Mooncell/Postdoc/Action Regulation OR';
+GO_TRIAL_RT_THRESHOLD = 2.0; % seconds 
+BASELINE_WINDOW_MS = 200; % Use first 200ms of each trial to measure noise
+Y_POSITION_LIMIT = 25000; % Y-axis limit for switch task
+Y_RESPONSE_THRESHOLD = 25000; % Y-axis threshold for correct switch response
+
+% Initialize global counters for aggregated results across all patients
+fprintf('--- Initializing Global Counters for Final Report ---\n');
+fields = {'GoTask_Go', 'StopTask_Go', 'StopTask_Stop', 'SwitchTask_Go', 'SwitchTask_Switch'};
+global_counts = struct();
+global_reclass = struct();
+for i = 1:length(fields)
+    if contains(fields{i}, '_Go')
+        global_counts.(fields{i}).Correct = 0;
+        global_counts.(fields{i}).Incorrect = 0;
+    else
+        global_counts.(fields{i}).Correct_Proactive = 0;
+        global_counts.(fields{i}).Correct_Reactive = 0;
+        global_counts.(fields{i}).Correct = 0;
+        global_counts.(fields{i}).Incorrect = 0;
+    end
+    % Re-classification tracking
+    global_reclass.(fields{i}).Total = 0;
+    global_reclass.(fields{i}).Reclassified = 0;
+    global_reclass.(fields{i}).CorrectToIncorrect = 0;
+    global_reclass.(fields{i}).IncorrectToCorrect = 0;
+end
+
+% Main processing loop - iterate through all patient folders
+patientFolders = dir(fullfile(baseDir, 'P*'));
+for p = 1:length(patientFolders)
+    patientDir = fullfile(baseDir, patientFolders(p).name);
+    patientID = patientFolders(p).name;
+    fprintf('\n\n===== Processing Patient: %s =====\n', patientID);
+
+    % Initialize patient-specific counters
+    patient_counts = struct();
+    patient_reclass = struct();
+    for i = 1:length(fields)
+        if contains(fields{i}, '_Go')
+            patient_counts.(fields{i}).Correct = 0;
+            patient_counts.(fields{i}).Incorrect = 0;
+        else
+            patient_counts.(fields{i}).Correct_Proactive = 0;
+            patient_counts.(fields{i}).Correct_Reactive = 0;
+            patient_counts.(fields{i}).Correct = 0;
+            patient_counts.(fields{i}).Incorrect = 0;
+        end
+        % Re-classification tracking
+        patient_reclass.(fields{i}).Total = 0;
+        patient_reclass.(fields{i}).Reclassified = 0;
+        patient_reclass.(fields{i}).CorrectToIncorrect = 0;
+        patient_reclass.(fields{i}).IncorrectToCorrect = 0;
+    end
+
+    % ===================================================================
+    % GO TASK DATA PROCESSING 
+    % ===================================================================
+    fprintf('  1. Loading Go Task data...\n');
+    go_data = []; 
+    joystickdataGo_sm_velocities = [];
+    go_kinematic_data = struct();
+    has_go_task = false;
+
+    try
+        % Load behavioral data files
+        go_files = dir(fullfile(patientDir, '*gotask_behav_exp*.mat'));
+        if ~isempty(go_files)
+            isAppleDouble = startsWith({go_files.name}, '._'); 
+            go_files = go_files(~isAppleDouble);
+        end
+
+        % Load processed kinematic data
+        go_sm_files = dir(fullfile(patientDir, 'processed', [patientID '_go_sm*.mat']));
+
+        if ~isempty(go_files) && ~isempty(go_sm_files)
+            load(fullfile(go_files(1).folder, go_files(1).name), 'go_data');
+            load(fullfile(go_sm_files(1).folder, go_sm_files(1).name), 'joystickdataGo_sm_velocities');
+            has_go_task = true;
+
+            % Extract kinematic data for each trial
+            for i = 1:min(size(go_data,1), length(joystickdataGo_sm_velocities))
+                % Skip incomplete trials
+                if go_data.complete(i) == 0
+                    continue;
+                end
+
+                if isempty(joystickdataGo_sm_velocities{1,i}) || isempty(joystickdataGo_sm_velocities{1,i}{1,2})
+                    continue; 
+                end
+
+                % Extract time and position data
+                time_data = joystickdataGo_sm_velocities{1,i}{1,1};
+                x_pos_data = joystickdataGo_sm_velocities{1,i}{1,2};
+                y_pos_data = joystickdataGo_sm_velocities{1,i}{1,3};
+
+                % Store kinematic data structure
+                go_kinematic_data(i).time = time_data;
+                go_kinematic_data(i).x_pos = x_pos_data;
+                go_kinematic_data(i).y_pos = y_pos_data;
+            end
+        else
+            fprintf('    -> Go task files not found for patient %s\n', patientID);
+        end
+    catch ME
+        warning('Could not process Go Task data for patient %s: %s', patientID, ME.message);
+    end
+
+    % ===================================================================
+    % STOP TASK DATA PROCESSING
+    % ===================================================================
+    fprintf('  2. Processing Stop Task data...\n');
+    stop_data = []; 
+    joystickdataStop_sm_velocities = []; 
+    stop_baseline_noise_std = []; 
+    stop_trial_displacements = [];
+    stop_kinematic_data = struct();
+
+    try
+        % Load behavioral data files
+        stop_files = dir(fullfile(patientDir, '*stop1_behav_exp*.mat'));
+        if ~isempty(stop_files)
+            isAppleDouble = startsWith({stop_files.name}, '._'); % Filter out system files
+            stop_files = stop_files(~isAppleDouble);
+        end
+
+        % Load processed kinematic data
+        stop_sm_files = dir(fullfile(patientDir, 'processed', [patientID '_stop_sm*.mat']));
+
+        if ~isempty(stop_files) && ~isempty(stop_sm_files)
+            load(fullfile(stop_files(1).folder, stop_files(1).name), 'stop_data');
+            load(fullfile(stop_sm_files(1).folder, stop_sm_files(1).name), 'joystickdataStop_sm_velocities');
+
+            % Extract kinematic data for each trial
+            types = nominal(stop_data.trial_type);
+            for i = 1:min(length(types), length(joystickdataStop_sm_velocities))
+                % Skip incomplete trials
+                if stop_data.complete(i) == 0
+                    continue;
+                end
+
+                if isempty(joystickdataStop_sm_velocities{1,i}) || isempty(joystickdataStop_sm_velocities{1,i}{1,2})
+                    continue; 
+                end
+
+                % Extract time and position data
+                time_data = joystickdataStop_sm_velocities{1,i}{1,1};
+                x_pos_data = joystickdataStop_sm_velocities{1,i}{1,2};
+                y_pos_data = joystickdataStop_sm_velocities{1,i}{1,3};
+
+                % Store kinematic data structure
+                stop_kinematic_data(i).time = time_data;
+                stop_kinematic_data(i).x_pos = x_pos_data;
+                stop_kinematic_data(i).y_pos = y_pos_data;
+                stop_kinematic_data(i).trial_type = char(types(i));
+
+                % Calculate peak displacement and baseline noise
+                peak_disp = max(abs(x_pos_data - x_pos_data(1)));
+                stop_baseline_noise_std(end+1) = std(x_pos_data(time_data <= (time_data(1) + BASELINE_WINDOW_MS/1000)));
+
+                % Collect displacement data for stop trials (for threshold calculation)
+                if eq(types(i), 'stop')
+                    stop_trial_displacements(end+1) = peak_disp;
+                end
+            end
+        else
+            fprintf('    -> Stop task files not found for patient %s\n', patientID);
+        end
+    catch ME
+        warning('Could not process Stop Task data for patient %s: %s', patientID, ME.message);
+    end
+
+    % ===================================================================
+    % SWITCH TASK DATA PROCESSING
+    % ===================================================================
+    fprintf('  3. Processing Switch Task data...\n');
+    switch_data = []; 
+    joystickdataSwitch_sm_velocities = [];
+    switch_baseline_noise_std = [];
+    switch_kinematic_data = struct();
+
+    try
+        % Load behavioral data files
+        switch_files = dir(fullfile(patientDir, '*switch_behav_exp*.mat'));
+        if ~isempty(switch_files)
+            isAppleDouble = startsWith({switch_files.name}, '._'); % Filter out system files
+            switch_files = switch_files(~isAppleDouble);
+        end
+
+        % Load processed kinematic data
+        switch_sm_files = dir(fullfile(patientDir, 'processed', [patientID '_switch_sm*.mat']));
+
+        if ~isempty(switch_files) && ~isempty(switch_sm_files)
+            load(fullfile(switch_files(1).folder, switch_files(1).name), 'switch_data');
+            load(fullfile(switch_sm_files(1).folder, switch_sm_files(1).name), 'joystickdataSwitch_sm_velocities');
+
+            % Extract kinematic data for each trial
+            types = nominal(switch_data.trial_type);
+            for i = 1:min(length(types), length(joystickdataSwitch_sm_velocities))
+                % Skip incomplete trials
+                if switch_data.complete(i) == 0
+                    continue;
+                end
+
+                if isempty(joystickdataSwitch_sm_velocities{1,i}) || isempty(joystickdataSwitch_sm_velocities{1,i}{1,2})
+                    continue; 
+                end
+
+                % Extract time and position data
+                time_data = joystickdataSwitch_sm_velocities{1,i}{1,1};
+                x_pos_data = joystickdataSwitch_sm_velocities{1,i}{1,2};
+                y_pos_data = joystickdataSwitch_sm_velocities{1,i}{1,3};
+
+                % Store kinematic data structure
+                switch_kinematic_data(i).time = time_data;
+                switch_kinematic_data(i).x_pos = x_pos_data;
+                switch_kinematic_data(i).y_pos = y_pos_data;
+                switch_kinematic_data(i).trial_type = char(types(i));
+
+                % Calculate baseline noise for threshold setting
+                switch_baseline_noise_std(end+1) = std(x_pos_data(time_data <= (time_data(1) + BASELINE_WINDOW_MS/1000)));
+            end
+        else
+            fprintf('    -> Switch task files not found for patient %s\n', patientID);
+        end
+    catch ME
+        warning('Could not process Switch Task data for patient %s: %s', patientID, ME.message);
+    end
+
+    % ===================================================================
+    % THRESHOLD CALCULATION (Patient-specific)
+    % ===================================================================
+    fprintf('  4. Calculating separate thresholds for this patient...\n');
+
+    % Check if we have sufficient data
+    if isempty(stop_baseline_noise_std) || isempty(stop_trial_displacements)
+        warning('Insufficient stop task data for patient %s', patientID);
+        continue;
+    end
+
+    if isempty(switch_baseline_noise_std)
+        warning('Insufficient switch task data for patient %s', patientID);
+        continue;
+    end
+
+    % Calculate proactive thresholds (3x baseline noise)
+    stop_proactive_threshold = 3 * mean(stop_baseline_noise_std, 'omitnan');
+    switch_proactive_threshold = 3 * mean(switch_baseline_noise_std, 'omitnan');
+
+    % Calculate displacement thresholds using Otsu's method
+    data_for_stop_thresh = stop_trial_displacements(stop_trial_displacements > 0);
+    if length(unique(data_for_stop_thresh)) > 2
+        stop_displacement_threshold = multithresh(data_for_stop_thresh, 1);
+    else
+        stop_displacement_threshold = mean(data_for_stop_thresh);
+    end
+
+    % Calculate switch trial displacements for threshold
+    switch_trial_displacements = [];
+    if exist('switch_data', 'var') && ~isempty(switch_data)
+        types = nominal(switch_data.trial_type);
+        for i = 1:min(length(types), length(joystickdataSwitch_sm_velocities))
+            % Skip incomplete trials for threshold calculation
+            if switch_data.complete(i) == 0
+                continue;
+            end
+            if isempty(joystickdataSwitch_sm_velocities{1,i}) || isempty(joystickdataSwitch_sm_velocities{1,i}{1,2})
+                continue; 
+            end
+            x_pos_data = joystickdataSwitch_sm_velocities{1,i}{1,2};
+            if eq(types(i), 'switch')
+                switch_trial_displacements(end+1) = max(abs(x_pos_data - x_pos_data(1)));
+            end
+        end
+    end
+
+    if isempty(switch_trial_displacements)
+        warning('No switch trials found for displacement threshold calculation for patient %s', patientID);
+        continue;
+    end
+
+    % Calculate switch displacement threshold
+    data_for_switch_thresh = switch_trial_displacements(switch_trial_displacements > 0);
+    if length(unique(data_for_switch_thresh)) > 2
+        switch_displacement_threshold = multithresh(data_for_switch_thresh, 1);
+    else
+        switch_displacement_threshold = mean(data_for_switch_thresh);
+    end
+
+    % Calculate Go task threshold (larger of Stop or Switch thresholds)
+    go_displacement_threshold = max(stop_displacement_threshold, switch_displacement_threshold);
+
+    % Display calculated thresholds
+    fprintf('     -> Stop: Proactive=%.0f, Displacement=%.0f\n', stop_proactive_threshold, stop_displacement_threshold);
+    fprintf('     -> Switch: Proactive=%.0f, Displacement=%.0f\n', switch_proactive_threshold, switch_displacement_threshold);
+    fprintf('     -> Go Task: Displacement=%.0f (max of Stop/Switch)\n', go_displacement_threshold);
+    fprintf('     -> Displacement Difference: %.0f (Stop-Switch)\n', stop_displacement_threshold - switch_displacement_threshold);
+
+    % ===================================================================
+    % GO TASK TRIAL CLASSIFICATION
+    % ===================================================================
+    if has_go_task
+        fprintf('  5. Classifying Go Task trials...\n');
+
+        % Initialize classification array with NaN (incomplete/unprocessed trials stay NaN)
+        go_classification = NaN(size(go_data, 1), 1);
+
+        % Classify all Go task trials
+        for i = 1:size(go_data, 1)
+            % Skip incomplete trials
+            if go_data.complete(i) == 0
+                continue;
+            end
+
+            if i > length(go_kinematic_data) || isempty(go_kinematic_data(i).x_pos)
+                continue; 
+            end
+
+            x_pos_data = go_kinematic_data(i).x_pos;
+            rt = go_data.rt(i);
+            trial_direction = char(go_data.direction(i));
+
+            % Compute directional displacement (check correct direction)
+            % Also compute wrong-direction displacement
+            if contains(trial_direction, 'left')
+                directed_disp = max(x_pos_data(1) - x_pos_data); % leftward = decreasing X
+                wrong_disp = max(x_pos_data - x_pos_data(1));    % rightward = wrong
+            elseif contains(trial_direction, 'right')
+                directed_disp = max(x_pos_data - x_pos_data(1)); % rightward = increasing X
+                wrong_disp = max(x_pos_data(1) - x_pos_data);    % leftward = wrong
+            else
+                directed_disp = 0; % unknown direction
+                wrong_disp = 0;
+            end
+
+            % Classification: Correct if displacement in correct direction > threshold
+            % AND RT < 2.0s AND wrong-direction displacement < threshold
+            if (directed_disp >= go_displacement_threshold) && (rt < GO_TRIAL_RT_THRESHOLD) && (wrong_disp < go_displacement_threshold)
+                go_classification(i) = 1; % Correct Go
+            else
+                go_classification(i) = 0; % Incorrect Go
+            end
+        end
+
+        % Count only completed trials (non-NaN)
+        completed_mask = ~isnan(go_classification);
+        patient_counts.GoTask_Go.Correct = sum(go_classification(completed_mask) == 1);
+        patient_counts.GoTask_Go.Incorrect = sum(go_classification(completed_mask) == 0);
+
+        % Re-classification tracking for Go Task
+        for i = 1:size(go_data, 1)
+            if isnan(go_classification(i)), continue; end
+            original_correct = go_data.correct(i);
+            new_correct = go_classification(i); % 1=correct, 0=incorrect
+            patient_reclass.GoTask_Go.Total = patient_reclass.GoTask_Go.Total + 1;
+            if original_correct ~= new_correct
+                patient_reclass.GoTask_Go.Reclassified = patient_reclass.GoTask_Go.Reclassified + 1;
+                if original_correct == 1 && new_correct == 0
+                    patient_reclass.GoTask_Go.CorrectToIncorrect = patient_reclass.GoTask_Go.CorrectToIncorrect + 1;
+                elseif original_correct == 0 && new_correct == 1
+                    patient_reclass.GoTask_Go.IncorrectToCorrect = patient_reclass.GoTask_Go.IncorrectToCorrect + 1;
+                end
+            end
+        end
+
+        % Save classification results
+        save(fullfile(patientDir, 'processed', [patientID '_go_classification_complete.mat']), ...
+            'go_classification', 'go_displacement_threshold');
+
+        fprintf('     -> Go Task trials classified - Correct: %d, Incorrect: %d (Total completed: %d)\n', ...
+            patient_counts.GoTask_Go.Correct, patient_counts.GoTask_Go.Incorrect, patient_reclass.GoTask_Go.Total);
+    else
+        fprintf('  5. Skipping Go Task classification (no data available)\n');
+    end
+
+    % ===================================================================
+    % STOP TASK TRIAL CLASSIFICATION
+    % ===================================================================
+    fprintf('  6. Classifying Stop Task trials with onset detection...\n');
+
+    if exist('stop_data', 'var') && ~isempty(stop_data)
+        % Initialize classification arrays with NaN
+        stop_classification = NaN(size(stop_data, 1), 1);
+        stop_ssrt_values = NaN(size(stop_data, 1), 1);
+
+        types = nominal(stop_data.trial_type);
+        go_indices = find(eq(types, 'go'));
+        stop_indices = find(eq(types, 'stop'));
+
+        % Classify Go trials (using STOP task displacement threshold)
+        for i = 1:length(go_indices)
+            idx = go_indices(i);
+
+            % Skip incomplete trials
+            if stop_data.complete(idx) == 0
+                continue;
+            end
+
+            if idx > length(stop_kinematic_data) || isempty(stop_kinematic_data(idx).x_pos)
+                continue; 
+            end
+
+            x_pos_data = stop_kinematic_data(idx).x_pos;
+            rt = stop_data.rt(idx);
+            trial_direction = char(stop_data.direction(idx));
+
+            % Compute directional displacement (check correct direction)
+            % Also compute wrong-direction displacement
+            if contains(trial_direction, 'left')
+                directed_disp = max(x_pos_data(1) - x_pos_data); % leftward = decreasing X
+                wrong_disp = max(x_pos_data - x_pos_data(1));    % rightward = wrong
+            elseif contains(trial_direction, 'right')
+                directed_disp = max(x_pos_data - x_pos_data(1)); % rightward = increasing X
+                wrong_disp = max(x_pos_data(1) - x_pos_data);    % leftward = wrong
+            else
+                directed_disp = 0;
+                wrong_disp = 0;
+            end
+
+            % Classification: Correct if displacement in correct direction > threshold
+            % AND RT < 2.0s AND wrong-direction displacement < threshold
+            if (directed_disp >= stop_displacement_threshold) && (rt < GO_TRIAL_RT_THRESHOLD) && (wrong_disp < stop_displacement_threshold)
+                stop_classification(idx) = 1; % Correct Go
+            else
+                stop_classification(idx) = 0; % Incorrect Go
+            end
+        end
+
+        % Classify Stop trials with onset detection
+        for i = 1:length(stop_indices)
+            idx = stop_indices(i);
+
+            % Skip incomplete trials
+            if stop_data.complete(idx) == 0
+                continue;
+            end
+
+            if idx > length(stop_kinematic_data) || isempty(stop_kinematic_data(idx).x_pos)
+                continue; 
+            end
+
+            time_data = stop_kinematic_data(idx).time;
+            x_pos_data = stop_kinematic_data(idx).x_pos;
+            stop_signal_time = double(stop_data.ssd(idx));
+            rt = stop_data.rt(idx);
+
+            % Check if response occurred before stop signal
+            if ~isnan(rt) && rt < stop_signal_time
+                stop_classification(idx) = 0; % Incorrect - response before SSD
+                fprintf('    -> Stop Trial %d classified as Incorrect (response before SSD)\n', idx);
+                continue;
+            end
+
+            peak_disp = max(abs(x_pos_data - x_pos_data(1)));
+
+            % Initial classification based on peak displacement
+            if peak_disp < stop_proactive_threshold
+                initial_class = 'Proactive';
+            elseif peak_disp < stop_displacement_threshold
+                initial_class = 'Reactive';
+            else
+                initial_class = 'Failed';
+            end
+
+            final_class = initial_class;
+            ssrt_value = NaN;
+
+            % For Reactive/Failed trials, detect stop onset using enhanced algorithm
+            if strcmp(initial_class, 'Reactive') || strcmp(initial_class, 'Failed')
+                [stop_onset_time, ssrt_value, ~, ~] = findStopPoint_enhanced(time_data, x_pos_data, stop_signal_time, initial_class);
+
+                % Re-classify Reactive trials without detectable SSRT as Proactive
+                if strcmp(initial_class, 'Reactive') && isnan(ssrt_value)
+                    final_class = 'Proactive';
+                    fprintf('    -> Trial %d re-assigned to Proactive (no SSRT detected)\n', idx);
+                end
+            end
+
+            stop_ssrt_values(idx) = ssrt_value;
+
+            % Final classification assignment
+            if strcmp(final_class, 'Proactive')
+                stop_classification(idx) = 2; % Proactive Correct
+            elseif strcmp(final_class, 'Reactive')
+                stop_classification(idx) = 1; % Reactive Correct
+            else % Failed
+                stop_classification(idx) = 0; % Incorrect
+            end
+        end
+
+        % Count only completed trials (non-NaN) for Go trials in stop task
+        completed_go = go_indices(~isnan(stop_classification(go_indices)));
+        patient_counts.StopTask_Go.Correct = sum(stop_classification(completed_go) == 1);
+        patient_counts.StopTask_Go.Incorrect = sum(stop_classification(completed_go) == 0);
+
+        % Count only completed trials (non-NaN) for Stop trials
+        completed_stop = stop_indices(~isnan(stop_classification(stop_indices)));
+        patient_counts.StopTask_Stop.Correct_Proactive = sum(stop_classification(completed_stop) == 2);
+        patient_counts.StopTask_Stop.Correct_Reactive = sum(stop_classification(completed_stop) == 1);
+        patient_counts.StopTask_Stop.Incorrect = sum(stop_classification(completed_stop) == 0);
+
+        % Re-classification tracking for Stop Task Go trials
+        for i = 1:length(go_indices)
+            idx = go_indices(i);
+            if isnan(stop_classification(idx)), continue; end
+            original_correct = stop_data.correct(idx);
+            new_correct = stop_classification(idx); % 1=correct, 0=incorrect
+            patient_reclass.StopTask_Go.Total = patient_reclass.StopTask_Go.Total + 1;
+            if original_correct ~= new_correct
+                patient_reclass.StopTask_Go.Reclassified = patient_reclass.StopTask_Go.Reclassified + 1;
+                if original_correct == 1 && new_correct == 0
+                    patient_reclass.StopTask_Go.CorrectToIncorrect = patient_reclass.StopTask_Go.CorrectToIncorrect + 1;
+                elseif original_correct == 0 && new_correct == 1
+                    patient_reclass.StopTask_Go.IncorrectToCorrect = patient_reclass.StopTask_Go.IncorrectToCorrect + 1;
+                end
+            end
+        end
+
+        % Re-classification tracking for Stop Task Stop trials
+        for i = 1:length(stop_indices)
+            idx = stop_indices(i);
+            if isnan(stop_classification(idx)), continue; end
+            original_correct = stop_data.correct(idx);
+            new_correct = double(stop_classification(idx) > 0); % Proactive(2) or Reactive(1) = correct
+            patient_reclass.StopTask_Stop.Total = patient_reclass.StopTask_Stop.Total + 1;
+            if original_correct ~= new_correct
+                patient_reclass.StopTask_Stop.Reclassified = patient_reclass.StopTask_Stop.Reclassified + 1;
+                if original_correct == 1 && new_correct == 0
+                    patient_reclass.StopTask_Stop.CorrectToIncorrect = patient_reclass.StopTask_Stop.CorrectToIncorrect + 1;
+                elseif original_correct == 0 && new_correct == 1
+                    patient_reclass.StopTask_Stop.IncorrectToCorrect = patient_reclass.StopTask_Stop.IncorrectToCorrect + 1;
+                end
+            end
+        end
+
+        % Save classification results
+        save(fullfile(patientDir, 'processed', [patientID '_stop_classification_complete.mat']), ...
+            'stop_classification', 'stop_ssrt_values');
+    end
+
+    % ===================================================================
+    % SWITCH TASK TRIAL CLASSIFICATION
+    % ===================================================================
+    fprintf('  7. Classifying Switch Task trials with onset detection...\n');
+
+    if exist('switch_data', 'var') && ~isempty(switch_data)
+        % Initialize classification arrays with NaN
+        switch_classification = NaN(size(switch_data, 1), 1);
+        switch_rt_values = NaN(size(switch_data, 1), 1);
+
+        types = nominal(switch_data.trial_type);
+        go_indices = find(eq(types, 'go'));
+        switch_indices = find(eq(types, 'switch'));
+
+        % Classify Go trials
+        for i = 1:length(go_indices)
+            idx = go_indices(i);
+
+            % Skip incomplete trials
+            if switch_data.complete(idx) == 0
+                continue;
+            end
+
+            if idx > length(switch_kinematic_data) || isempty(switch_kinematic_data(idx).x_pos)
+                continue; 
+            end
+
+            x_pos_data = switch_kinematic_data(idx).x_pos;
+            rt = switch_data.rt(idx);
+            trial_direction = char(switch_data.direction(idx));
+
+            % Compute directional displacement (check correct direction)
+            % Also compute wrong-direction displacement
+            if contains(trial_direction, 'left')
+                directed_disp = max(x_pos_data(1) - x_pos_data); % leftward = decreasing X
+                wrong_disp = max(x_pos_data - x_pos_data(1));    % rightward = wrong
+            elseif contains(trial_direction, 'right')
+                directed_disp = max(x_pos_data - x_pos_data(1)); % rightward = increasing X
+                wrong_disp = max(x_pos_data(1) - x_pos_data);    % leftward = wrong
+            else
+                directed_disp = 0;
+                wrong_disp = 0;
+            end
+
+            % Classification: Correct if displacement in correct direction > threshold
+            % AND RT < 2.0s AND wrong-direction displacement < threshold
+            if (directed_disp >= switch_displacement_threshold) && (rt < GO_TRIAL_RT_THRESHOLD) && (wrong_disp < switch_displacement_threshold)
+                switch_classification(idx) = 1; % Correct Go
+            else
+                switch_classification(idx) = 0; % Incorrect Go
+            end
+        end
+
+        % Classify Switch trials with onset detection
+        for i = 1:length(switch_indices)
+            idx = switch_indices(i);
+
+            % Skip incomplete trials
+            if switch_data.complete(idx) == 0
+                continue;
+            end
+
+            if idx > length(switch_kinematic_data) || isempty(switch_kinematic_data(idx).x_pos)
+                continue; 
+            end
+
+            time_data = switch_kinematic_data(idx).time;
+            x_pos_data = switch_kinematic_data(idx).x_pos;
+            y_pos_data = switch_kinematic_data(idx).y_pos;
+            switch_signal_time = double(switch_data.swsd(idx));
+            trial_direction = char(switch_data.direction(idx));
+            rt = switch_data.rt(idx);
+
+            % Check if response occurred before switch signal
+            if ~isnan(rt) && rt < switch_signal_time
+                switch_classification(idx) = 0; % Incorrect - response before SWSD
+                fprintf('    -> Switch Trial %d classified as Incorrect (response before SWSD)\n', idx);
+                continue;
+            end
+
+            peak_disp = max(abs(x_pos_data - x_pos_data(1)));
+
+            % Initial classification based on peak displacement
+            if peak_disp < switch_proactive_threshold
+                initial_class = 'Proactive';
+            elseif peak_disp < switch_displacement_threshold
+                initial_class = 'Reactive';
+            else
+                initial_class = 'Failed';
+            end
+
+            final_class = initial_class;
+            rt_value = NaN;
+
+            % For Reactive/Failed trials, detect switch onset using hybrid algorithm
+            if strcmp(initial_class, 'Reactive') || strcmp(initial_class, 'Failed')
+                [switch_onset_time, ~, ~] = findSwitchPoint_hybrid(time_data, x_pos_data, y_pos_data, switch_signal_time, trial_direction, Y_POSITION_LIMIT);
+
+                if ~isnan(switch_onset_time)
+                    rt_value = switch_onset_time - switch_signal_time;
+                end
+
+                % Apply additional constraints for Reactive trials
+                if strcmp(initial_class, 'Reactive')
+                    if ~isnan(switch_onset_time)
+                        % Check X-axis constraint (movement must exceed proactive threshold)
+                        x_at_onset = interp1(time_data, x_pos_data, switch_onset_time, 'linear', 'extrap');
+                        x_constraint_failed = abs(x_at_onset - x_pos_data(1)) < switch_proactive_threshold;
+
+                        % Check Y-axis constraint (vertical movement within limits)
+                        y_at_onset = interp1(time_data, y_pos_data, switch_onset_time, 'linear', 'extrap');
+                        y_constraint_failed = abs(y_at_onset) > Y_POSITION_LIMIT;
+
+                        if x_constraint_failed || y_constraint_failed
+                            final_class = 'Proactive';
+                            fprintf('    -> Trial %d re-assigned to Proactive (constraint failed)\n', idx);
+                        end
+                    else
+                        final_class = 'Proactive';
+                        fprintf('    -> Trial %d re-assigned to Proactive (no onset detected)\n', idx);
+                    end
+                end
+            end
+
+            % Check Y-axis response in correct direction for correct switch trials
+            % Must cross Y_RESPONSE_THRESHOLD in the correct direction to be correct
+            if ~strcmp(final_class, 'Failed')
+                if contains(trial_direction, 'up')
+                    % Up = negative Y in joystick coordinates
+                    peak_y_correct = max(-(y_pos_data - y_pos_data(1)));
+                elseif contains(trial_direction, 'down')
+                    % Down = positive Y in joystick coordinates
+                    peak_y_correct = max(y_pos_data - y_pos_data(1));
+                else
+                    peak_y_correct = 0; % unknown direction
+                end
+
+                if peak_y_correct < Y_RESPONSE_THRESHOLD
+                    final_class = 'Failed';
+                    fprintf('    -> Trial %d re-assigned to Failed (Y-axis did not reach threshold in correct direction)\n', idx);
+                end
+            end
+
+            switch_rt_values(idx) = rt_value;
+
+            % Final classification assignment
+            if strcmp(final_class, 'Proactive')
+                switch_classification(idx) = 2; % Proactive Correct
+            elseif strcmp(final_class, 'Reactive')
+                switch_classification(idx) = 1; % Reactive Correct
+            else % Failed
+                switch_classification(idx) = 0; % Incorrect
+            end
+        end
+
+        % Count only completed trials (non-NaN) for Go trials in switch task
+        completed_go = go_indices(~isnan(switch_classification(go_indices)));
+        patient_counts.SwitchTask_Go.Correct = sum(switch_classification(completed_go) == 1);
+        patient_counts.SwitchTask_Go.Incorrect = sum(switch_classification(completed_go) == 0);
+
+        % Count only completed trials (non-NaN) for Switch trials
+        completed_switch = switch_indices(~isnan(switch_classification(switch_indices)));
+        patient_counts.SwitchTask_Switch.Correct_Proactive = sum(switch_classification(completed_switch) == 2);
+        patient_counts.SwitchTask_Switch.Correct_Reactive = sum(switch_classification(completed_switch) == 1);
+        patient_counts.SwitchTask_Switch.Incorrect = sum(switch_classification(completed_switch) == 0);
+
+        % Re-classification tracking for Switch Task Go trials
+        for i = 1:length(go_indices)
+            idx = go_indices(i);
+            if isnan(switch_classification(idx)), continue; end
+            original_correct = switch_data.correct(idx);
+            new_correct = switch_classification(idx); % 1=correct, 0=incorrect
+            patient_reclass.SwitchTask_Go.Total = patient_reclass.SwitchTask_Go.Total + 1;
+            if original_correct ~= new_correct
+                patient_reclass.SwitchTask_Go.Reclassified = patient_reclass.SwitchTask_Go.Reclassified + 1;
+                if original_correct == 1 && new_correct == 0
+                    patient_reclass.SwitchTask_Go.CorrectToIncorrect = patient_reclass.SwitchTask_Go.CorrectToIncorrect + 1;
+                elseif original_correct == 0 && new_correct == 1
+                    patient_reclass.SwitchTask_Go.IncorrectToCorrect = patient_reclass.SwitchTask_Go.IncorrectToCorrect + 1;
+                end
+            end
+        end
+
+        % Re-classification tracking for Switch Task Switch trials
+        for i = 1:length(switch_indices)
+            idx = switch_indices(i);
+            if isnan(switch_classification(idx)), continue; end
+            original_correct = switch_data.correct(idx);
+            new_correct = double(switch_classification(idx) > 0); % Proactive(2) or Reactive(1) = correct
+            patient_reclass.SwitchTask_Switch.Total = patient_reclass.SwitchTask_Switch.Total + 1;
+            if original_correct ~= new_correct
+                patient_reclass.SwitchTask_Switch.Reclassified = patient_reclass.SwitchTask_Switch.Reclassified + 1;
+                if original_correct == 1 && new_correct == 0
+                    patient_reclass.SwitchTask_Switch.CorrectToIncorrect = patient_reclass.SwitchTask_Switch.CorrectToIncorrect + 1;
+                elseif original_correct == 0 && new_correct == 1
+                    patient_reclass.SwitchTask_Switch.IncorrectToCorrect = patient_reclass.SwitchTask_Switch.IncorrectToCorrect + 1;
+                end
+            end
+        end
+
+        % Save classification results
+        save(fullfile(patientDir, 'processed', [patientID '_switch_classification_complete.mat']), ...
+            'switch_classification', 'switch_rt_values');
+    end
+
+    % ===================================================================
+    % DISPLAY PATIENT RESULTS
+    % ===================================================================
+    fprintf('\n  -> Classification Results for %s:\n', patientID);
+    if has_go_task
+        fprintf('     - Go Task:           Correct: %d, Incorrect: %d\n', patient_counts.GoTask_Go.Correct, patient_counts.GoTask_Go.Incorrect);
+    end
+    fprintf('     - Stop Task (Go):    Correct: %d, Incorrect: %d\n', patient_counts.StopTask_Go.Correct, patient_counts.StopTask_Go.Incorrect);
+    fprintf('     - Stop Task (Stop):  Proactive: %d, Reactive: %d, Failed: %d\n', patient_counts.StopTask_Stop.Correct_Proactive, patient_counts.StopTask_Stop.Correct_Reactive, patient_counts.StopTask_Stop.Incorrect);
+    fprintf('     - Switch Task (Go):  Correct: %d, Incorrect: %d\n', patient_counts.SwitchTask_Go.Correct, patient_counts.SwitchTask_Go.Incorrect);
+    fprintf('     - Switch Task (Switch): Proactive: %d, Reactive: %d, Failed: %d\n', patient_counts.SwitchTask_Switch.Correct_Proactive, patient_counts.SwitchTask_Switch.Correct_Reactive, patient_counts.SwitchTask_Switch.Incorrect);
+
+    % Display re-classification summary for this patient
+    fprintf('\n  -> Re-classification Summary for %s:\n', patientID);
+    for i = 1:length(fields)
+        fname = fields{i};
+        r = patient_reclass.(fname);
+        if r.Total > 0
+            fprintf('     - %-22s Total: %3d, Reclassified: %3d (%5.1f%%), Correct->Incorrect: %d, Incorrect->Correct: %d\n', ...
+                strrep(fname, '_', ' '), r.Total, r.Reclassified, ...
+                100*r.Reclassified/r.Total, r.CorrectToIncorrect, r.IncorrectToCorrect);
+        else
+            fprintf('     - %-22s No completed trials\n', strrep(fname, '_', ' '));
+        end
+    end
+
+    % Aggregate counts to global totals
+    for i = 1:length(fields)
+        f_names = fieldnames(patient_counts.(fields{i}));
+        for j = 1:length(f_names)
+            if isfield(global_counts.(fields{i}), f_names{j})
+                global_counts.(fields{i}).(f_names{j}) = global_counts.(fields{i}).(f_names{j}) + patient_counts.(fields{i}).(f_names{j});
+            end
+        end
+        % Aggregate re-classification counts
+        r_names = fieldnames(patient_reclass.(fields{i}));
+        for j = 1:length(r_names)
+            global_reclass.(fields{i}).(r_names{j}) = global_reclass.(fields{i}).(r_names{j}) + patient_reclass.(fields{i}).(r_names{j});
+        end
+    end
+
+
+end
+
+% ===================================================================
+% FINAL REPORTING
+% ===================================================================
+fprintf('\n\n===== FINAL AGGREGATE REPORTS (ALL PATIENTS) =====\n');
+fprintf('\n--- Total Classification Counts (Complete Method) ---\n');
+fprintf('Go Task:              Correct: %d, Incorrect: %d\n', global_counts.GoTask_Go.Correct, global_counts.GoTask_Go.Incorrect);
+fprintf('Stop Task (Go):       Correct: %d, Incorrect: %d\n', global_counts.StopTask_Go.Correct, global_counts.StopTask_Go.Incorrect);
+fprintf('Stop Task (Stop):     Proactive: %d, Reactive: %d, Failed: %d\n', global_counts.StopTask_Stop.Correct_Proactive, global_counts.StopTask_Stop.Correct_Reactive, global_counts.StopTask_Stop.Incorrect);
+fprintf('Switch Task (Go):     Correct: %d, Incorrect: %d\n', global_counts.SwitchTask_Go.Correct, global_counts.SwitchTask_Go.Incorrect);
+fprintf('Switch Task (Switch): Proactive: %d, Reactive: %d, Failed: %d\n', global_counts.SwitchTask_Switch.Correct_Proactive, global_counts.SwitchTask_Switch.Correct_Reactive, global_counts.SwitchTask_Switch.Incorrect);
+
+fprintf('\n--- Aggregate Re-classification Summary (All Patients) ---\n');
+for i = 1:length(fields)
+    fname = fields{i};
+    r = global_reclass.(fname);
+    if r.Total > 0
+        fprintf('%-22s Total: %4d, Reclassified: %4d (%5.1f%%), Correct->Incorrect: %d, Incorrect->Correct: %d\n', ...
+            strrep(fname, '_', ' '), r.Total, r.Reclassified, ...
+            100*r.Reclassified/r.Total, r.CorrectToIncorrect, r.IncorrectToCorrect);
+    else
+        fprintf('%-22s No completed trials\n', strrep(fname, '_', ' '));
+    end
+end
+
+fprintf('\n\n===== Complete batch processing finished. =====\n');
+
+%% ========================================================================
+%  HELPER FUNCTIONS
+%  ========================================================================
+
+function [stopTime, ssrt, reward, cumulativeReward] = findStopPoint_enhanced(time, x_pos, stop_signal_time, classification_str)
+    % Enhanced stop onset detection algorithm
+    % Works for both successful reactive stops and failed stop attempts
+    % Uses cumulative reward function to detect movement cessation
+
+    stopTime = NaN; ssrt = NaN; reward = []; cumulativeReward = [];
+
+    % Movement detection threshold - more sensitive for failed stops
+    if strcmp(classification_str, 'Failed')
+        HORIZONTAL_DISPLACEMENT_THRESHOLD = 25;  % Lower threshold for failed stops
+    else
+        HORIZONTAL_DISPLACEMENT_THRESHOLD = 50;  % Original threshold for successful stops
+    end
+
+    time = time(:); x_pos = x_pos(:);
+    x_displacement = abs(x_pos - x_pos(1));
+
+    % Find when significant movement begins
+    gate_open_idx = find(x_displacement > HORIZONTAL_DISPLACEMENT_THRESHOLD, 1, 'first');
+    if isempty(gate_open_idx), return; end
+
+    % Calculate velocities
+    vx = gradient(x_pos) ./ gradient(time); 
+    vx(isnan(vx)) = 0;
+    speed = abs(vx);
+
+    % Determine onset threshold - more sensitive for failed stops
+    if strcmp(classification_str, 'Failed')
+        onset_threshold = 0.05 * max(speed(gate_open_idx:end));  % Lower threshold
+    else
+        onset_threshold = 0.10 * max(speed(gate_open_idx:end));  % Original threshold
+    end
+
+    % Find movement onset
+    onset_idx_relative = find(speed(gate_open_idx:end) > onset_threshold, 1, 'first');
+    if isempty(onset_idx_relative)
+        onset_idx = gate_open_idx; 
+    else
+        onset_idx = gate_open_idx + onset_idx_relative - 1; 
+    end
+
+    % Determine initial movement direction
+    dir_window_end = min(length(vx), onset_idx + round(0.150 / mean(diff(time))));
+    initial_vx_sign = sign(mean(vx(onset_idx:dir_window_end)));
+    if initial_vx_sign == 0, initial_vx_sign = 1; end
+
+    % Create reward signal (favors movement in initial direction)
+    reward = vx * initial_vx_sign;
+    cumulativeReward = cumsum(reward);
+
+    % Find the stopping point (peak of cumulative reward)
+    if strcmp(classification_str, 'Failed')
+        % For failed stops, look for peaks after stop signal
+        signal_idx = find(time >= stop_signal_time, 1, 'first');
+        if isempty(signal_idx), return; end
+
+        [peak_vals, peak_indices_relative] = findpeaks(cumulativeReward(signal_idx:end));
+        if ~isempty(peak_vals)
+            [~, max_peak_idx] = max(peak_vals);
+            peakIdx = signal_idx + peak_indices_relative(max_peak_idx) - 1;
+        else
+            [~, max_idx_relative] = max(cumulativeReward(signal_idx:end));
+            peakIdx = signal_idx + max_idx_relative - 1;
+        end
+    else
+        % For successful reactive stops, use global maximum
+        [~, peakIdx] = max(cumulativeReward);
+    end
+
+    detected_stop_time = time(peakIdx);
+
+    % Validate that stop attempt occurred after stop signal
+    if detected_stop_time < stop_signal_time, return; end 
+
+    calculated_ssrt = detected_stop_time - stop_signal_time;
+
+    % Set constraints based on trial type
+    MIN_RT = 0.100; 
+    if strcmp(classification_str, 'Failed')
+        MAX_RT = 1.500;  % More lenient for failed stops
+    else
+        MAX_RT = 1.000;  % Original constraint for successful stops
+    end
+
+    % Validate reaction time is within reasonable bounds
+    if calculated_ssrt >= MIN_RT && calculated_ssrt <= MAX_RT
+        stopTime = detected_stop_time;
+        ssrt = calculated_ssrt;
+    end
+end
+
+function [switchTime, reward, cumulativeReward] = findSwitchPoint_hybrid(time, x_pos, y_pos, switch_signal_time, trial_direction, y_limit)
+    % Hybrid switch onset detection algorithm
+    % Uses weighted reward function considering both X and Y movement
+    % Finds switch onset by detecting peaks in cumulative reward after switch signal
+
+    reward = []; cumulativeReward = []; switchTime = NaN;
+    time = time(:); x_pos = x_pos(:); y_pos = y_pos(:);
+
+    % Calculate velocities
+    vx = gradient(x_pos) ./ gradient(time); 
+    vy = gradient(y_pos) ./ gradient(time);
+    vx(isnan(vx)) = 0; vy(isnan(vy)) = 0;
+
+    % Determine expected direction
+    if contains(trial_direction, 'left')
+        initial_vx_sign = -1;
+    elseif contains(trial_direction, 'right')
+        initial_vx_sign = 1;
+    else
+        warning('Invalid horizontal direction: %s', trial_direction); 
+        return; 
+    end
+
+    % Weighted reward function (favors horizontal movement, penalizes vertical)
+    weight_x = 3.0; 
+    weight_y = 1.0;
+    reward = (weight_x * (vx * initial_vx_sign)) - (weight_y * abs(vy));
+
+    cumulativeReward = cumsum(reward);
+    time_for_reward = time;
+
+    % Find switch signal time index
+    signal_idx = find(time_for_reward >= switch_signal_time, 1, 'first');
+    if isempty(signal_idx), return; end
+
+    % Find peaks in cumulative reward after switch signal
+    [peak_vals, peak_indices_relative] = findpeaks(cumulativeReward(signal_idx:end));
+    if isempty(peak_vals), return; end
+
+    % Sort peaks by magnitude (highest first)
+    [~, sort_order] = sort(peak_vals, 'descend');
+    sorted_peak_indices = signal_idx + peak_indices_relative(sort_order) - 1;
+
+    % Apply constraints to find valid switch onset
+    MIN_REACTION_TIME = 0.100;
+    MAX_REACTION_TIME = 1.500;
+
+    for i = 1:length(sorted_peak_indices)
+        candidate_idx = sorted_peak_indices(i);
+        candidate_time = time_for_reward(candidate_idx);
+
+        % Check temporal validity
+        reaction_time = candidate_time - switch_signal_time;
+        is_temporally_valid = reaction_time >= MIN_REACTION_TIME && reaction_time <= MAX_REACTION_TIME;
+
+        % Check spatial validity (relaxed for failed trials)
+        y_at_candidate = interp1(time, y_pos, candidate_time, 'linear', 'extrap');
+        is_spatially_valid = abs(y_at_candidate) <= y_limit * 2;
+
+        if is_temporally_valid && is_spatially_valid
+            switchTime = candidate_time; 
+            return; 
+        end
+    end
+end
